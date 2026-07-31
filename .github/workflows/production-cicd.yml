@@ -1,282 +1,143 @@
 name: Enterprise AWS CI/CD Pipeline
 
-on:
+on: 
   push:
-    branches:
-      - main
+    branches: [ "main" ]
 
-  pull_request:
-    branches:
-      - main
-
-  workflow_dispatch:
-
-permissions:
-  id-token: write
-  contents: read
-  security-events: write
-  packages: write
-  actions: read
-
-concurrency:
-  group: production-${{ github.ref }}
+# Only one deployment runs at a time; cancels any in-progress run on new push   
+concurrency: 
+  group: production-deployment
   cancel-in-progress: true
 
+# CRITICAL: Required for AWS OIDC authentication and CodeQL
+permissions:
+  id-token: write        # Request JWT from GitHub for OIDC
+  contents: read         # Clone the repository
+  security-events: write # Upload CodeQL/Trivy results to GitHub Security tab
+  packages: write        # Push images to GitHub Container Registry 
+
 env:
-  NODE_VERSION: "20"
-
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   AWS_REGION: ap-south-1
-
   ECR_REPOSITORY: zomato
-
   ECS_CLUSTER: netflix-cluster
-
   ECS_SERVICE: zomato-service
-
   CONTAINER_NAME: netflix
 
 jobs:
 
-###########################################################
-# Unit Test
-###########################################################
-
-  unit-tests:
-
-    name: Unit Tests
-
+  # ── Job 1: Unit Tests ──────────────────────────────────────────────────────
+  unit_tests:
+    name: Run Unit Tests
     runs-on: ubuntu-latest
-
-    timeout-minutes: 10
-
     steps:
-
       - uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
+          node-version: '18'
+          cache: 'npm'
 
-      - name: Install Dependencies
-        run: npm ci
+      - run: npm ci
+      - run: npm test
 
-      - name: Run Unit Tests
-        run: npm test
-
-###########################################################
-# CodeQL
-###########################################################
-
-  codeql:
-
-    name: Static Code Analysis
-
+  # ── Job 2: SAST (CodeQL) ───────────────────────────────────────────────────
+  sast_scan:
+    name: CodeQL Static Analysis
     runs-on: ubuntu-latest
-
-    timeout-minutes: 20
-
     steps:
-
       - uses: actions/checkout@v4
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
-          languages: javascript
+          languages: 'javascript'
 
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v4
-
-      - name: Analyze
+      - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
 
-###########################################################
-# Build + Scan
-###########################################################
-
-  build:
-
-    name: Build Docker Image
-
-    needs:
-      - unit-tests
-      - codeql
-
+  # ── Job 3: Build & Container Vulnerability Scan ────────────────────────────
+  build_and_container_scan:
+    name: Build & Scan Docker Image
+    needs: [unit_tests, sast_scan]
     runs-on: ubuntu-latest
-
-    timeout-minutes: 30
-
-    outputs:
-      image: ${{ steps.meta.outputs.image }}
-
     steps:
-
       - uses: actions/checkout@v4
 
-      #######################################
-      # Configure AWS
-      #######################################
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.10.0
 
-      - name: Configure AWS Credentials
+      - name: Build local image for scanning
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: local-test-image:latest
+
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'local-test-image:latest'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '0'
+
+      - name: Upload Trivy Results to GitHub Security Tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # ── Job 4: Deploy to AWS ECS via OIDC ─────────────────────────────────────
+  deploy_to_aws_ecs:
+    name: Deploy to Production
+    needs: build_and_container_scan
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # OIDC: No hardcoded AWS Access Keys
+      - name: Configure AWS Credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-
-      #######################################
-      # Login to ECR
-      #######################################
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      #######################################
-      # Docker Buildx
-      #######################################
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      #######################################
-      # Build Image
-      #######################################
-
-      - name: Build Docker Image
-
-        id: meta
-
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
         env:
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
-
         run: |
-
           docker build \
+            --cache-from $ECR_REGISTRY/$ECR_REPOSITORY:buildcache \
             --build-arg BUILDKIT_INLINE_CACHE=1 \
-            -t $REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG \
-            -t $REGISTRY/${{ env.ECR_REPOSITORY }}:latest .
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          docker push -a $ECR_REGISTRY/$ECR_REPOSITORY
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-          echo "image=$REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG" >> $GITHUB_OUTPUT
-
-      #######################################
-      # Filesystem Scan
-      #######################################
-
-      - name: Trivy Filesystem Scan
-        uses: aquasecurity/trivy-action@0.30.0
-        with:
-          scan-type: fs
-          scan-ref: .
-          severity: HIGH,CRITICAL
-          format: sarif
-          output: trivy-fs.sarif
-
-      #######################################
-      # Container Scan
-      #######################################
-
-      - name: Trivy Image Scan
-        uses: aquasecurity/trivy-action@0.30.0
-        with:
-          image-ref: ${{ steps.meta.outputs.image }}
-          severity: HIGH,CRITICAL
-          format: sarif
-          output: trivy-image.sarif
-
-      #######################################
-      # Upload Scan Results
-      #######################################
-
-      - name: Upload Filesystem Scan
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-fs.sarif
-
-      - name: Upload Image Scan
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-image.sarif
-
-      #######################################
-      # Push Image
-      #######################################
-
-      - name: Push Docker Image
-
-        run: |
-
-          docker push ${{ steps.meta.outputs.image }}
-
-          docker push \
-          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
-
-###########################################################
-# Deploy
-###########################################################
-
-  deploy:
-
-    name: Deploy to Amazon ECS
-
-    needs: build
-
-    runs-on: ubuntu-latest
-
-    timeout-minutes: 30
-
-    environment: production
-
-    steps:
-
-      - uses: actions/checkout@v4
-
-      #######################################
-      # Configure AWS
-      #######################################
-
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      #######################################
-      # Render Task Definition
-      #######################################
-
-      - name: Render ECS Task Definition
-
-        id: task-definition
-
+      - name: Fill in the new image ID in the ECS task definition
+        id: task-def
         uses: aws-actions/amazon-ecs-render-task-definition@v1
-
         with:
-
           task-definition: task-definition.json
-
           container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
 
-          image: ${{ needs.build.outputs.image }}
-
-      #######################################
-      # Deploy
-      #######################################
-
-      - name: Deploy to ECS
-
+      - name: Deploy Amazon ECS task definition
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
-
         with:
-
-          task-definition: ${{ steps.task-definition.outputs.task-definition }}
-
-          cluster: ${{ env.ECS_CLUSTER }}
-
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
           service: ${{ env.ECS_SERVICE }}
-
+          cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
-
-          wait-for-minutes: 15
