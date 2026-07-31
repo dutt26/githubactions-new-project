@@ -1,6 +1,6 @@
 {
-  "family": "enterprise-gh-app-task",
-  "networkMode": "awsvpc",
+  "family": "netflix",
+  "networkMode": "zomato-vpc",
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "256",
   "memory": "512",
