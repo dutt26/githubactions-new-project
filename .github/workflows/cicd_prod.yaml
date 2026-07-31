@@ -22,7 +22,7 @@ env:
   ECR_REPOSITORY: zomato
   ECS_CLUSTER: netflix-cluster
   ECS_SERVICE: zomato-service
-  CONTAINER_NAME: netflix
+  CONTAINER_NAME: zomato
 
 jobs:
 
