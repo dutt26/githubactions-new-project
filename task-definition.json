@@ -7,7 +7,7 @@
   "executionRoleArn": "arn:aws:iam::532975549450:role/ecsTaskExecutionRole",
   "containerDefinitions": [
     {
-      "name": "netflix",
+      "name": "zomato",
       "image": "REPLACE_ME_DYNAMICALLY",
       "essential": true,
       "portMappings": [
