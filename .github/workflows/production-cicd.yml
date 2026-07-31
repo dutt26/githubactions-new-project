@@ -18,11 +18,11 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  AWS_REGION: us-east-1
-  ECR_REPOSITORY: enterprise-gh-app
-  ECS_CLUSTER: enterprise-gh-app-cluster
-  ECS_SERVICE: enterprise-gh-app-service
-  CONTAINER_NAME: enterprise-gh-app-container
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: zomato
+  ECS_CLUSTER: netflix-cluster
+  ECS_SERVICE: zomato-service
+  CONTAINER_NAME: netflix
 
 jobs:
 
