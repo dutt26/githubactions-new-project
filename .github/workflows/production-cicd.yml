@@ -11,7 +11,7 @@ concurrency:
 
 # CRITICAL: Required for AWS OIDC authentication and CodeQL
 permissions:
-  id-token: write        # Request JWT from GitHub for OIDC
+  ##id-token: write        # Request JWT from GitHub for OIDC
   contents: read         # Clone the repository
   security-events: write # Upload CodeQL/Trivy results to GitHub Security tab
   packages: write        # Push images to GitHub Container Registry 
