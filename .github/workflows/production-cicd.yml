@@ -5,44 +5,58 @@ on:
     branches:
       - main
 
+  pull_request:
+    branches:
+      - main
+
   workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
   security-events: write
+  packages: write
+  actions: read
 
 concurrency:
-  group: production-deployment
+  group: production-${{ github.ref }}
   cancel-in-progress: true
 
 env:
+  NODE_VERSION: "20"
+
   AWS_REGION: ap-south-1
 
   ECR_REPOSITORY: zomato
 
   ECS_CLUSTER: netflix-cluster
+
   ECS_SERVICE: zomato-service
+
   CONTAINER_NAME: netflix
 
 jobs:
 
-  ##########################################
-  # Unit Tests
-  ##########################################
+###########################################################
+# Unit Test
+###########################################################
 
-  unit-test:
+  unit-tests:
+
+    name: Unit Tests
 
     runs-on: ubuntu-latest
+
+    timeout-minutes: 10
 
     steps:
 
       - uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
       - name: Install Dependencies
@@ -51,18 +65,17 @@ jobs:
       - name: Run Unit Tests
         run: npm test
 
-  ##########################################
-  # CodeQL
-  ##########################################
+###########################################################
+# CodeQL
+###########################################################
 
   codeql:
 
+    name: Static Code Analysis
+
     runs-on: ubuntu-latest
 
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
+    timeout-minutes: 20
 
     steps:
 
@@ -79,24 +92,32 @@ jobs:
       - name: Analyze
         uses: github/codeql-action/analyze@v4
 
-  ##########################################
-  # Build Docker Image
-  ##########################################
+###########################################################
+# Build + Scan
+###########################################################
 
   build:
 
+    name: Build Docker Image
+
     needs:
-      - unit-test
+      - unit-tests
       - codeql
 
     runs-on: ubuntu-latest
 
+    timeout-minutes: 30
+
     outputs:
-      image: ${{ steps.image.outputs.image }}
+      image: ${{ steps.meta.outputs.image }}
 
     steps:
 
       - uses: actions/checkout@v4
+
+      #######################################
+      # Configure AWS
+      #######################################
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -104,63 +125,107 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Debug GitHub Context
-        run: |
-          echo "Repository: $GITHUB_REPOSITORY"
-          echo "Branch: $GITHUB_REF"
+      #######################################
+      # Login to ECR
+      #######################################
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      #######################################
+      # Docker Buildx
+      #######################################
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      #######################################
+      # Build Image
+      #######################################
+
       - name: Build Docker Image
-        id: image
+
+        id: meta
+
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
+
         run: |
 
           docker build \
-          -t $REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG \
-          -t $REGISTRY/${{ env.ECR_REPOSITORY }}:latest .
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            -t $REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG \
+            -t $REGISTRY/${{ env.ECR_REPOSITORY }}:latest .
 
           echo "image=$REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-      - name: Trivy Scan
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: ${{ steps.image.outputs.image }}
-          format: sarif
-          output: trivy-results.sarif
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
+      #######################################
+      # Filesystem Scan
+      #######################################
 
-      - name: Upload Trivy Report
-        if: always()
+      - name: Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          format: sarif
+          output: trivy-fs.sarif
+
+      #######################################
+      # Container Scan
+      #######################################
+
+      - name: Trivy Image Scan
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image }}
+          severity: HIGH,CRITICAL
+          format: sarif
+          output: trivy-image.sarif
+
+      #######################################
+      # Upload Scan Results
+      #######################################
+
+      - name: Upload Filesystem Scan
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: trivy-results.sarif
+          sarif_file: trivy-fs.sarif
+
+      - name: Upload Image Scan
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+
+      #######################################
+      # Push Image
+      #######################################
 
       - name: Push Docker Image
+
         run: |
 
-          docker push ${{ steps.image.outputs.image }}
+          docker push ${{ steps.meta.outputs.image }}
 
           docker push \
           ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
 
-  ##########################################
-  # Deploy to ECS
-  ##########################################
+###########################################################
+# Deploy
+###########################################################
 
   deploy:
+
+    name: Deploy to Amazon ECS
 
     needs: build
 
     runs-on: ubuntu-latest
+
+    timeout-minutes: 30
 
     environment: production
 
@@ -168,28 +233,50 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      #######################################
+      # Configure AWS
+      #######################################
+
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+      #######################################
+      # Render Task Definition
+      #######################################
 
-      - name: Render Task Definition
+      - name: Render ECS Task Definition
+
         id: task-definition
+
         uses: aws-actions/amazon-ecs-render-task-definition@v1
+
         with:
+
           task-definition: task-definition.json
+
           container-name: ${{ env.CONTAINER_NAME }}
+
           image: ${{ needs.build.outputs.image }}
 
+      #######################################
+      # Deploy
+      #######################################
+
       - name: Deploy to ECS
+
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+
         with:
+
           task-definition: ${{ steps.task-definition.outputs.task-definition }}
+
           cluster: ${{ env.ECS_CLUSTER }}
+
           service: ${{ env.ECS_SERVICE }}
+
           wait-for-service-stability: true
+
+          wait-for-minutes: 15
