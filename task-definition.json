@@ -4,10 +4,10 @@
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "256",
   "memory": "512",
-  "executionRoleArn": "arn:aws:iam::442847318784:role/GitHubActionsECSRole",
+  "executionRoleArn": "arn:aws:iam::532975549450:role/ecsTaskExecutionRole",
   "containerDefinitions": [
     {
-      "name": "enterprise-gh-app-container",
+      "name": "netflix",
       "image": "REPLACE_ME_DYNAMICALLY",
       "essential": true,
       "portMappings": [
@@ -20,8 +20,8 @@
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
-          "awslogs-group": "/ecs/enterprise-gh-app",
-          "awslogs-region": "us-east-1",
+          "awslogs-group": "/ecs/netflix",
+          "awslogs-region": "ap-south-1",
           "awslogs-stream-prefix": "ecs"
         }
       }
